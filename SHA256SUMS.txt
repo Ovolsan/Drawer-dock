@@ -1,0 +1,1 @@
+7314ff0e37f53b3ece6bfe4d6c7a5949d74fcb456f84067e4017e0e84a452d6d  drawer_dock.plugin

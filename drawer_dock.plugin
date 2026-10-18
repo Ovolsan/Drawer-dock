@@ -1,0 +1,1034 @@
+from base_plugin import BasePlugin, MethodHook, AppEvent
+from java.lang import Class as JClass
+from android_utils import run_on_ui_thread, log
+from ui.settings import Header, Divider, Slider, Text as SettingsText
+try:
+    from ui.settings import SimpleSettingFactory
+except Exception:
+    SimpleSettingFactory = None
+from ui.settings import Switch
+from ui.bulletin import BulletinHelper
+import threading
+import time
+
+try:
+    from java import dynamic_proxy, jclass as _jclass_dp
+
+    class LongClickProxy(dynamic_proxy(_jclass_dp("android.view.View$OnLongClickListener"))):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onLongClick(self, v):
+            try:
+                return bool(self.fn(v))
+            except Exception as e:
+                log(f"[drawer_dock] долгое нажатие: {e}")
+                return False
+
+    class ClickProxy(dynamic_proxy(_jclass_dp("android.view.View$OnClickListener"))):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onClick(self, v):
+            try:
+                self.fn(v)
+            except Exception as e:
+                log(f"[drawer_dock] нажатие: {e}")
+
+    class TouchProxy(dynamic_proxy(_jclass_dp("android.view.View$OnTouchListener"))):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onTouch(self, v, ev):
+            try:
+                return bool(self.fn(v, ev))
+            except Exception as e:
+                log(f"[drawer_dock] перетаскивание: {e}")
+                return False
+
+    class SeekProxy(dynamic_proxy(_jclass_dp("android.widget.SeekBar$OnSeekBarChangeListener"))):
+        def __init__(self, changed, stopped):
+            super().__init__()
+            self.changed = changed
+            self.stopped = stopped
+
+        def onProgressChanged(self, bar, progress, from_user):
+            if from_user:
+                try:
+                    self.changed(int(progress))
+                except Exception as e:
+                    log(f"[drawer_dock] высота: {e}")
+
+        def onStartTrackingTouch(self, bar):
+            pass
+
+        def onStopTrackingTouch(self, bar):
+            self.stopped()
+
+    class DismissProxy(dynamic_proxy(_jclass_dp("android.widget.PopupWindow$OnDismissListener"))):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onDismiss(self):
+            self.fn()
+
+    PROXY_OK = True
+except Exception:
+    PROXY_OK = False
+    TouchProxy = None
+
+__id__ = "drawer_dock"
+__name__ = "Нижняя строка панели"
+__description__ = "Выносит выбранные пункты боковой панели в закреплённую строку иконок внизу, как в сгруппированном меню сообщений."
+__author__ = "@aura_plugins @bandaliyev @Ovolsan @Ovolpost"
+__version__ = "20261018"
+__icon__ = "pus_heen/16"
+__min_version__ = "11.12.0"
+__app_version__ = ">=11.12.0"
+
+TAG = "[drawer_dock]"
+DOCK_TAG = "drawer_dock_row"
+ROW_TAG = "drawer_dock_buttons"
+CARD_TAG = "drawer_cards_card"
+MAX_ITEMS = 4
+HEIGHT_MIN = 40
+HEIGHT_MAX = 200
+HEIGHT_DEFAULT = 56
+MENU_VIEW_CLASS_NAMES = [
+    "app.exteraless.drawer.DrawerMenuView",
+    "com.exteragram.messenger.drawer.DrawerMenuView",
+]
+ITEM_CLASS_NAMES = [
+    "app.exteraless.drawer.DrawerMenuItemView",
+    "com.exteragram.messenger.drawer.DrawerMenuItemView",
+]
+HOOKED_METHODS = ("rebuildMenu", "updateColors", "updateUnreadCounters")
+
+# id пункта (как в MainMenuItem клиента) -> название в настройках
+ITEMS = [
+    (14, "Архив"),
+    (18, "Профиль"),
+    (2, "Новая группа"),
+    (6, "Контакты"),
+    (3, "Новый канал"),
+    (10, "Звонки"),
+    (11, "Избранное"),
+    (8, "Настройки"),
+    (101, "Браузер"),
+    (102, "Плагины"),
+    (17, "Войти по QR"),
+    (106, "Лента"),
+    (107, "Режим призрака"),
+    (108, "Недавние чаты"),
+]
+
+
+def _unquote(v):
+    if isinstance(v, str) and len(v) >= 2 and v[0] == v[-1] == '"':
+        return v[1:-1]
+    return v
+
+
+def _to_bool(v, default=False):
+    v = _unquote(v)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+        return default
+    if v is None:
+        return default
+    return bool(v)
+
+
+def _clamp_height(value):
+    try:
+        return max(HEIGHT_MIN, min(HEIGHT_MAX, int(round(float(_unquote(value))))))
+    except (TypeError, ValueError, OverflowError):
+        return HEIGHT_DEFAULT
+
+
+def _jclass(name):
+    from java import jclass
+    return jclass(name)
+
+
+def _is_a(obj, cls_name):
+    try:
+        return JClass.forName(cls_name).isInstance(obj)
+    except Exception:
+        return False
+
+
+def _class_name(v):
+    try:
+        return str(v.getClass().getName())
+    except Exception:
+        return ""
+
+
+def _is_plain_divider(v):
+    return _class_name(v) == "android.view.View"
+
+
+def _tag_is(v, tag):
+    try:
+        t = v.getTag()
+        return t is not None and str(t) == tag
+    except Exception:
+        return False
+
+
+def _children(group):
+    return [group.getChildAt(i) for i in range(int(group.getChildCount()))]
+
+
+def _field(obj, name):
+    """Значение поля (в том числе приватного) по имени, ищем и в родительских классах."""
+    try:
+        cls = obj.getClass()
+        while cls is not None:
+            for f in cls.getDeclaredFields():
+                if str(f.getName()) == name:
+                    f.setAccessible(True)
+                    return f.get(obj)
+            cls = cls.getSuperclass()
+    except Exception:
+        pass
+    return None
+
+
+def _button_id(v):
+    x = _field(v, "layoutButtonId")
+    try:
+        return int(x) if x is not None else None
+    except Exception:
+        return None
+
+
+def _is_item(v):
+    for n in ITEM_CLASS_NAMES:
+        if _is_a(v, n):
+            return True
+    return False
+
+
+def _first_text(view):
+    out = []
+
+    def walk(v, depth=0):
+        if out:
+            return
+        if _is_a(v, "android.widget.TextView"):
+            t = v.getText()
+            if t is not None and str(t):
+                out.append(str(t))
+                return
+        if depth < 4 and _is_a(v, "android.view.ViewGroup"):
+            for ch in _children(v):
+                walk(ch, depth + 1)
+    walk(view)
+    return out[0] if out else ""
+
+
+class MenuHook(MethodHook):
+    def __init__(self, plugin, kind):
+        super().__init__()
+        self.plugin = plugin
+        self.kind = kind
+        self._err_logged = False
+
+    def after_hooked_method(self, param):
+        try:
+            if self.plugin._stop_event.is_set():
+                return
+            mv = param.thisObject
+            if self.kind == "rebuildMenu":
+                self.plugin.apply(mv)
+            elif self.kind == "updateColors":
+                self.plugin.refresh_dock(mv)
+            elif self.kind == "updateUnreadCounters":
+                self.plugin.refresh_badges(int(param.args[0]))
+        except Exception as e:
+            if not self._err_logged:
+                self._err_logged = True
+                log(f"{TAG} {self.kind}: {e}")
+
+
+class DrawerDockPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.unhooks = []
+        self._stop_event = threading.Event()
+        self.moved = []            # [(id, пункт-источник, drawable, подпись)]
+        self.badges = {}           # id -> TextView
+        self.proxies = []
+        self.orig_padding = {}     # id(container) -> нижний отступ списка до нас
+        self._preview_height = None
+        self._live_popup = None
+        self._dock_row = None
+        self._height_controls = []
+
+    # ----- жизненный цикл -------------------------------------------------
+    def on_plugin_load(self):
+        self._stop_event.clear()
+        self._install_hooks()
+        threading.Thread(target=self._boot, daemon=True).start()
+        log(f"{TAG} загружен")
+
+    def on_plugin_unload(self):
+        self._stop_event.set()
+        for u in list(self.unhooks):
+            try:
+                self.unhook_method(u)
+            except Exception as e:
+                log(f"{TAG} не удалось снять хук: {e}")
+        self.unhooks.clear()
+
+        def restore():
+            self._close_live_settings()
+            self._for_each_menu(self._clear_dock)
+            self._for_each_menu(self._rebuild)
+        run_on_ui_thread(restore)
+
+    def on_app_event(self, event_type):
+        if event_type in (AppEvent.PAUSE, AppEvent.STOP):
+            run_on_ui_thread(self._close_live_settings)
+
+    def _install_hooks(self):
+        seen_classes = set()
+        for cname in MENU_VIEW_CLASS_NAMES:
+            try:
+                cls = JClass.forName(cname)
+            except Exception:
+                continue
+            # exteraless перенаправляет старое имя exteraGram на тот же класс.
+            # Двойной after-hook сначала выносил пункты, затем стирал готовую
+            # строку, потому что второй вызов уже не находил их в меню.
+            resolved_name = str(cls.getName())
+            if resolved_name in seen_classes:
+                continue
+            seen_classes.add(resolved_name)
+            n = 0
+            for m in cls.getDeclaredMethods():
+                name = str(m.getName())
+                if name not in HOOKED_METHODS:
+                    continue
+                try:
+                    m.setAccessible(True)
+                    u = self.hook_method(m, MenuHook(self, name), priority=-20)
+                    if u:
+                        self.unhooks.append(u)
+                        n += 1
+                except Exception as e:
+                    log(f"{TAG} {cname}.{name}: {e}")
+            log(f"{TAG} меню панели {cname}: подключено методов {n}")
+
+    def _boot(self):
+        """Панель уже могла быть собрана: пересобираем её, чтобы наши хуки отработали."""
+        for delay in (1, 4, 10):
+            if self._stop_event.wait(delay):
+                return
+            run_on_ui_thread(lambda: self._for_each_menu(self._rebuild))
+
+    def _activity(self):
+        try:
+            from client_utils import get_last_fragment
+            frag = get_last_fragment()
+            return frag, (frag.getParentActivity() if frag else None)
+        except Exception as e:
+            log(f"{TAG} экран не получен: {e}")
+            return None, None
+
+    def _for_each_menu(self, fn):
+        frag, act = self._activity()
+        if act is None:
+            return
+
+        def walk(v, depth=0):
+            for n in MENU_VIEW_CLASS_NAMES:
+                if _is_a(v, n):
+                    try:
+                        fn(v)
+                    except Exception as e:
+                        log(f"{TAG} {e}")
+                    return
+            if depth < 14 and _is_a(v, "android.view.ViewGroup"):
+                for ch in _children(v):
+                    walk(ch, depth + 1)
+        walk(act.getWindow().getDecorView())
+
+    def _rebuild(self, mv):
+        """Штатная пересборка панели: наши хуки отработают на ней."""
+        from org.telegram.messenger import UserConfig
+        frag, _ = self._activity()
+        mv.rebuildMenu(int(UserConfig.selectedAccount), frag)
+
+    # ----- настройки ------------------------------------------------------
+    def _height(self):
+        if self._preview_height is not None:
+            return self._preview_height
+        return _clamp_height(self.get_setting("dock_height", HEIGHT_DEFAULT))
+
+    def _resize_dock(self):
+        row = self._dock_row
+        if row is None or row.getParent() is None:
+            return
+        from org.telegram.messenger import AndroidUtilities
+        params = row.getLayoutParams()
+        params.height = int(AndroidUtilities.dp(float(self._height())))
+        row.setLayoutParams(params)
+
+    def _set_height(self, value, persist=True):
+        if self._stop_event.is_set():
+            return
+        height = _clamp_height(value)
+        self._preview_height = height
+        if persist:
+            self._save_height(reload_settings=self._live_popup is not None)
+        self._resize_dock()
+        for control in self._height_controls:
+            control["value"].setText(f"{height} dp")
+            control["seek"].setProgress(height - HEIGHT_MIN)
+        popup = self._live_popup
+        if popup is not None:
+            popup["value"].setText(f"{height} dp")
+            popup["seek"].setProgress(height - HEIGHT_MIN)
+
+    def _save_height(self, reload_settings=False):
+        if self._preview_height is not None:
+            self.set_setting("dock_height", self._preview_height, reload_settings=reload_settings)
+            self._preview_height = None
+
+    def _height_changed(self, value):
+        run_on_ui_thread(lambda: self._set_height(value))
+
+    def _build_height_view(self, ctx):
+        from android.widget import LinearLayout, TextView, SeekBar
+        from android.view import Gravity
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+
+        dp = lambda x: int(AndroidUtilities.dp(float(x)))
+        box = LinearLayout(ctx)
+        box.setOrientation(LinearLayout.VERTICAL)
+        box.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+        box.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+        box.setPadding(dp(20), dp(12), dp(20), dp(12))
+
+        def text(label, size, color):
+            view = TextView(ctx)
+            view.setText(label)
+            view.setTextSize(1, float(size))
+            view.setTextColor(Theme.getColor(color))
+            view.setSingleLine(False)
+            return view
+
+        heading = LinearLayout(ctx)
+        heading.setGravity(Gravity.CENTER_VERTICAL)
+        title = text("Высота панели", 16, Theme.key_windowBackgroundWhiteBlackText)
+        heading.addView(title, LinearLayout.LayoutParams(0, -2, 1.0))
+        value = text(f"{self._height()} dp", 16, Theme.key_windowBackgroundWhiteBlueText)
+        value.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL)
+        heading.addView(value, LinearLayout.LayoutParams(-2, -2))
+        box.addView(heading, LinearLayout.LayoutParams(-1, -2))
+
+        hint = text("Изменяется сразу, без перезапуска", 14, Theme.key_windowBackgroundWhiteGrayText2)
+        hint.setPadding(0, dp(4), 0, 0)
+        box.addView(hint, LinearLayout.LayoutParams(-1, -2))
+        seek = SeekBar(ctx)
+        seek.setContentDescription("Высота панели")
+        seek.setMax(HEIGHT_MAX - HEIGHT_MIN)
+        seek.setProgress(self._height() - HEIGHT_MIN)
+        box.addView(seek, LinearLayout.LayoutParams(-1, dp(48)))
+
+        action = LinearLayout(ctx)
+        action.setOrientation(LinearLayout.VERTICAL)
+        action.setPadding(0, dp(10), 0, dp(8))
+        action.setBackground(Theme.createRadSelectorDrawable(Theme.getColor(Theme.key_listSelector), 8, 8))
+        action.setContentDescription("Открыть плавающее окно настройки высоты")
+        label = text("Настроить поверх панели", 16, Theme.key_windowBackgroundWhiteBlueText)
+        action.addView(label, LinearLayout.LayoutParams(-1, -2))
+        description = text("Плавающее окно для проверки высоты и нажатий", 14,
+                           Theme.key_windowBackgroundWhiteGrayText2)
+        description.setPadding(0, dp(4), 0, 0)
+        action.addView(description, LinearLayout.LayoutParams(-1, -2))
+        box.addView(action, LinearLayout.LayoutParams(-1, -2))
+
+        seek_listener = SeekProxy(lambda progress: self._set_height(progress + HEIGHT_MIN, False),
+                                  self._save_height)
+        seek.setOnSeekBarChangeListener(seek_listener)
+
+        def touch(view, event):
+            if int(event.getActionMasked()) == 0:
+                view.getParent().requestDisallowInterceptTouchEvent(True)
+            return False
+
+        touch_listener = TouchProxy(touch)
+        seek.setOnTouchListener(touch_listener)
+        click_listener = ClickProxy(self.show_live_settings)
+        action.setOnClickListener(click_listener)
+        self._height_controls.append({"value": value, "seek": seek,
+                                      "listeners": [seek_listener, touch_listener, click_listener]})
+        return box
+
+    def show_live_settings(self, *args):
+        run_on_ui_thread(self._show_live_settings)
+
+    def _close_live_settings(self):
+        popup = self._live_popup
+        self._live_popup = None
+        self._save_height(reload_settings=True)
+        if popup is not None:
+            popup["window"].dismiss()
+
+    def _show_live_settings(self):
+        if self._stop_event.is_set():
+            return
+        if self._live_popup is not None and self._live_popup["window"].isShowing():
+            return
+        try:
+            self._open_live_settings()
+        except Exception as e:
+            self._close_live_settings()
+            log(f"{TAG} плавающие настройки: {e}")
+            BulletinHelper.show_error("Не удалось открыть плавающие настройки")
+
+    def _open_live_settings(self):
+        if not PROXY_OK:
+            BulletinHelper.show_info("Используйте ползунок высоты в настройках плагина")
+            return
+        menus = []
+        self._for_each_menu(menus.append)
+        if not menus:
+            BulletinHelper.show_info("Откройте боковую панель и повторите попытку")
+            return
+        mv = menus[0]
+        parent = mv.getParent()
+        while parent is not None:
+            if _tag_is(parent, "drawer_container") or _class_name(parent).endswith(".DrawerContainer"):
+                parent.openDrawer(True)
+                break
+            parent = parent.getParent()
+
+        from android.widget import LinearLayout, TextView, SeekBar, PopupWindow
+        from android.view import Gravity
+        from android.graphics.drawable import GradientDrawable
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+
+        ctx = mv.getContext()
+        root = mv.getRootView()
+        dp = lambda x: int(AndroidUtilities.dp(float(x)))
+        width = min(dp(280), int(root.getWidth()) - dp(32))
+        if int(mv.getWidth()) > dp(64):
+            width = min(width, int(mv.getWidth()) - dp(24))
+        card = LinearLayout(ctx)
+        card.setOrientation(LinearLayout.VERTICAL)
+        card.setPadding(dp(16), dp(4), dp(16), dp(8))
+        background = GradientDrawable()
+        background.setColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+        background.setCornerRadius(float(dp(16)))
+        card.setBackground(background)
+
+        def text(label, size=15, accent=False):
+            view = TextView(ctx)
+            view.setText(label)
+            view.setTextSize(1, float(size))
+            view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText if accent
+                                            else Theme.key_windowBackgroundWhiteBlackText))
+            view.setGravity(Gravity.CENTER_VERTICAL)
+            return view
+
+        header = LinearLayout(ctx)
+        header.setGravity(Gravity.CENTER_VERTICAL)
+        title = text("Высота панели", 16)
+        title.setTypeface(AndroidUtilities.bold())
+        title.setContentDescription("Переместить окно настроек")
+        header.addView(title, LinearLayout.LayoutParams(0, -1, 1.0))
+        close = text("×", 26)
+        close.setGravity(Gravity.CENTER)
+        close.setContentDescription("Закрыть настройки высоты")
+        header.addView(close, LinearLayout.LayoutParams(dp(40), -1))
+        card.addView(header, LinearLayout.LayoutParams(-1, dp(44)))
+
+        value = text(f"{self._height()} dp", 18, True)
+        value.setGravity(Gravity.CENTER)
+        card.addView(value, LinearLayout.LayoutParams(-1, dp(32)))
+        seek = SeekBar(ctx)
+        seek.setContentDescription("Высота панели")
+        seek.setMax(HEIGHT_MAX - HEIGHT_MIN)
+        seek.setProgress(self._height() - HEIGHT_MIN)
+        card.addView(seek, LinearLayout.LayoutParams(-1, dp(48)))
+        hint = text("Меняется сразу · потяните заголовок", 12)
+        hint.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2))
+        hint.setGravity(Gravity.CENTER)
+        card.addView(hint, LinearLayout.LayoutParams(-1, dp(28)))
+
+        buttons = LinearLayout(ctx)
+        card.addView(buttons, LinearLayout.LayoutParams(-1, dp(44)))
+        window = PopupWindow(card, width, -2, False)
+        window.setBackgroundDrawable(background)
+        window.setElevation(float(dp(8)))
+        window.setOutsideTouchable(False)
+        window.setInputMethodMode(2)
+        window.setClippingEnabled(True)
+        try:
+            window.setTouchModal(False)
+        except Exception:
+            pass
+        popup = {"window": window, "value": value, "seek": seek, "listeners": [],
+                 "x": dp(12), "y": dp(100), "down": None}
+
+        def listen(view, fn):
+            listener = ClickProxy(lambda v: fn())
+            popup["listeners"].append(listener)
+            view.setOnClickListener(listener)
+
+        listen(close, self._close_live_settings)
+        for label, description, action in (
+                ("−", "Уменьшить высоту", lambda: self._set_height(self._height() - 1)),
+                ("Сброс", "Сбросить высоту до 56 dp", lambda: self._set_height(HEIGHT_DEFAULT)),
+                ("+", "Увеличить высоту", lambda: self._set_height(self._height() + 1))):
+            button = text(label, 16, True)
+            button.setGravity(Gravity.CENTER)
+            button.setContentDescription(description)
+            button.setBackground(Theme.createRadSelectorDrawable(Theme.getColor(Theme.key_listSelector), 8, 8))
+            listen(button, action)
+            buttons.addView(button, LinearLayout.LayoutParams(0, -1, 1.0))
+        listener = SeekProxy(lambda progress: self._set_height(progress + HEIGHT_MIN, False),
+                             lambda: self._save_height(reload_settings=True))
+        popup["listeners"].append(listener)
+        seek.setOnSeekBarChangeListener(listener)
+
+        def drag(view, event):
+            action = int(event.getActionMasked())
+            if action == 0:
+                popup["down"] = (float(event.getRawX()), float(event.getRawY()), popup["x"], popup["y"])
+                return True
+            if action == 2 and popup["down"] is not None:
+                x, y, origin_x, origin_y = popup["down"]
+                popup["x"] = max(dp(8), min(int(root.getWidth()) - width - dp(8),
+                                           origin_x + int(event.getRawX() - x)))
+                popup["y"] = max(dp(40), min(int(root.getHeight()) - int(card.getHeight()) - dp(56),
+                                            origin_y + int(event.getRawY() - y)))
+                window.update(popup["x"], popup["y"], -1, -1)
+            if action in (1, 3):
+                popup["down"] = None
+            return True
+
+        listener = TouchProxy(drag)
+        popup["listeners"].append(listener)
+        title.setOnTouchListener(listener)
+        header.setOnTouchListener(listener)
+
+        def dismissed():
+            if self._live_popup is popup:
+                self._live_popup = None
+                self._save_height(reload_settings=True)
+            popup["listeners"].clear()
+
+        listener = DismissProxy(dismissed)
+        popup["listeners"].append(listener)
+        window.setOnDismissListener(listener)
+        self._live_popup = popup
+        window.showAtLocation(root, Gravity.TOP | Gravity.LEFT, popup["x"], popup["y"])
+
+    def _order(self):
+        """Все id в сохранённом порядке; новые пункты, которых там нет, идут в конце."""
+        known = [i for i, _ in ITEMS]
+        saved = []
+        raw = _unquote(self.get_setting("dock_order", ""))
+        for part in str(raw or "").split(","):
+            part = part.strip()
+            if part.isdigit() and int(part) in known and int(part) not in saved:
+                saved.append(int(part))
+        return saved + [i for i in known if i not in saved]
+
+    def _selected_ids(self):
+        return [i for i in self._order() if _to_bool(self.get_setting(f"dock_{i}", False))]
+
+    def _changed(self, bid, value):
+        others = [i for i in self._selected_ids() if i != bid]
+        key = f"dock_{bid}"
+        if _to_bool(value) and len(others) >= MAX_ITEMS:
+            self.set_setting(key, False, reload_settings=True)
+            BulletinHelper.show_info(f"В строку помещается не больше {MAX_ITEMS} пунктов")
+            return
+        run_on_ui_thread(lambda: self._for_each_menu(self._rebuild))
+
+    def _build_order_view(self, ctx):
+        """Список всех пунктов: нажатие включает или выключает, зажатие и перетаскивание меняет порядок."""
+        from android.widget import LinearLayout, TextView, ImageView
+        from android.view import Gravity
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+
+        dp = lambda x: int(AndroidUtilities.dp(float(x)))
+        self.drag_proxies = []
+        h = dp(48)
+        names = dict(ITEMS)
+        order = self._order()
+        base = {bid: i for i, bid in enumerate(order)}
+        rows = {}
+        marks = {}
+        st = {"drag": None, "down_y": 0.0}
+
+        box = LinearLayout(ctx)
+        box.setOrientation(LinearLayout.VERTICAL)
+        box.setClipChildren(False)
+        box.setClipToPadding(False)
+
+        def paint(bid):
+            on = _to_bool(self.get_setting(f"dock_{bid}", False))
+            m = marks[bid]
+            m.setText("●" if on else "○")
+            m.setTextColor(Theme.getColor(Theme.key_featuredStickers_addButton if on
+                                          else Theme.key_windowBackgroundWhiteGrayText2))
+
+        def shift_others():
+            d = st["drag"]
+            for bid, row in rows.items():
+                if d is not None and bid == d:
+                    continue
+                row.setTranslationY(float((order.index(bid) - base[bid]) * h))
+
+        def save_order():
+            self.set_setting("dock_order", ",".join(str(i) for i in order))
+
+        def finish():
+            d = st["drag"]
+            st["drag"] = None
+            if d is None:
+                return
+            box.removeAllViews()
+            for i, bid in enumerate(order):
+                row = rows[bid]
+                row.setTranslationY(0.0)
+                row.setTranslationZ(0.0)
+                row.setAlpha(1.0)
+                base[bid] = i
+                box.addView(row)
+            save_order()
+            log(f"{TAG} порядок: {order}")
+            run_on_ui_thread(lambda: self._for_each_menu(self._rebuild))
+
+        def on_long(bid):
+            def fn(v):
+                st["drag"] = bid
+                v.setTranslationZ(float(dp(6)))
+                v.setAlpha(0.92)
+                try:
+                    v.performHapticFeedback(0)
+                    v.getParent().requestDisallowInterceptTouchEvent(True)
+                except Exception:
+                    pass
+                return True
+            return fn
+
+        def on_touch(bid):
+            def fn(v, ev):
+                a = int(ev.getActionMasked())
+                if a == 0:
+                    st["down_y"] = float(ev.getRawY())
+                    return False
+                if st["drag"] != bid:
+                    return False
+                if a == 2:
+                    dy = float(ev.getRawY()) - st["down_y"]
+                    v.setTranslationY(dy)
+                    target = int(round(base[bid] + dy / h))
+                    target = max(0, min(len(order) - 1, target))
+                    if target != order.index(bid):
+                        order.remove(bid)
+                        order.insert(target, bid)
+                        shift_others()
+                    return True
+                if a in (1, 3):
+                    finish()
+                    return True
+                return True
+            return fn
+
+        def on_click(bid):
+            def fn(v):
+                on = _to_bool(self.get_setting(f"dock_{bid}", False))
+                if not on and len(self._selected_ids()) >= MAX_ITEMS:
+                    BulletinHelper.show_info(f"В строку помещается не больше {MAX_ITEMS} пунктов")
+                    return
+                self.set_setting(f"dock_{bid}", not on)
+                paint(bid)
+                run_on_ui_thread(lambda: self._for_each_menu(self._rebuild))
+            return fn
+
+        for bid in order:
+            row = LinearLayout(ctx)
+            row.setOrientation(LinearLayout.HORIZONTAL)
+            row.setGravity(Gravity.CENTER_VERTICAL)
+            row.setPadding(dp(20), 0, dp(20), 0)
+            row.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+            mark = TextView(ctx)
+            mark.setTextSize(1, 18.0)
+            marks[bid] = mark
+            row.addView(mark, LinearLayout.LayoutParams(dp(28), -2))
+            title = TextView(ctx)
+            title.setText(names.get(bid, str(bid)))
+            title.setTextSize(1, 16.0)
+            title.setSingleLine(True)
+            title.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            tlp = LinearLayout.LayoutParams(0, -2, 1.0)
+            tlp.leftMargin = dp(12)
+            row.addView(title, tlp)
+            grip = TextView(ctx)
+            grip.setText("☰")
+            grip.setTextSize(1, 18.0)
+            grip.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2))
+            row.addView(grip, LinearLayout.LayoutParams(-2, -2))
+            long_p = LongClickProxy(on_long(bid))
+            touch_p = TouchProxy(on_touch(bid))
+            click_p = ClickProxy(on_click(bid))
+            self.drag_proxies.extend([long_p, touch_p, click_p])
+            row.setOnLongClickListener(long_p)
+            row.setOnTouchListener(touch_p)
+            row.setOnClickListener(click_p)
+            rows[bid] = row
+            paint(bid)
+            box.addView(row, LinearLayout.LayoutParams(-1, h))
+        return box
+
+    def create_settings(self):
+        self._height_controls = []
+        ui = [Header(text="Размер панели")]
+        if PROXY_OK and SimpleSettingFactory is not None:
+            factory = SimpleSettingFactory(create_view=lambda ctx, *args: self._build_height_view(ctx))
+            ui.append(factory())
+        else:
+            ui.extend([
+                Slider(key="dock_height", text="Высота панели", default=HEIGHT_DEFAULT,
+                       min=HEIGHT_MIN, max=HEIGHT_MAX, step=1, on_change=self._height_changed),
+                SettingsText(text="Настроить поверх панели", accent=True, on_click=self.show_live_settings),
+                Divider(text="Плавающее окно для проверки высоты и нажатий")])
+        ui.extend([Divider(), Header(text=f"Вынести вниз (до {MAX_ITEMS})")])
+        drag_ok = PROXY_OK and TouchProxy is not None and SimpleSettingFactory is not None
+        if drag_ok:
+            try:
+                self.drag_proxies = []
+                factory = SimpleSettingFactory(create_view=lambda ctx, *a: self._build_order_view(ctx))
+                ui.append(factory())
+            except Exception as e:
+                log(f"{TAG} список для перетаскивания недоступен: {e}")
+                drag_ok = False
+        if not drag_ok:
+            for bid, name in ITEMS:
+                ui.append(Switch(key=f"dock_{bid}", text=name, default=False,
+                                 on_change=lambda v, b=bid: self._changed(b, v)))
+        ui.append(Divider(text="Нажмите на пункт, чтобы вынести его вниз или вернуть. Зажмите и перетащите, "
+                               "чтобы поменять порядок: иконки в строке идут в том же порядке слева направо. "
+                               "Нажатие на иконку делает то же, что и сам пункт, долгое нажатие показывает "
+                               "название. У «Архива» и «Ленты» виден счётчик непрочитанных. "
+                               "Пункты, которых сейчас нет в панели (например, пустой архив), не показываются."))
+        return ui
+
+    # ----- вынос пунктов --------------------------------------------------
+    def _container(self, mv):
+        try:
+            if int(mv.getChildCount()) > 0:
+                c = mv.getChildAt(0)
+                if _is_a(c, "android.widget.LinearLayout"):
+                    return c
+        except Exception:
+            pass
+        return None
+
+    def _tidy_dividers(self, container):
+        """После выноса пунктов убираем висящие и двойные разделители."""
+        kids = _children(container)
+        prev_div = True          # считаем начало списка разделителем: ведущие уберём
+        for ch in kids:
+            if _is_plain_divider(ch):
+                if prev_div:
+                    container.removeView(ch)
+                else:
+                    prev_div = True
+            else:
+                prev_div = False
+        kids = _children(container)
+        while kids and _is_plain_divider(kids[-1]):
+            container.removeView(kids[-1])
+            kids = _children(container)
+
+    def apply(self, mv):
+        container = self._container(mv)
+        if container is None:
+            return
+        selected = set(self._selected_ids())
+        found = []
+        if selected:
+            for ch in _children(container):
+                if _is_item(ch):
+                    if _button_id(ch) in selected:
+                        found.append(ch)
+                elif _tag_is(ch, CARD_TAG):          # пункты внутри контейнеров плагина «Контейнеры в панели»
+                    for it in _children(ch):
+                        if _is_item(it) and _button_id(it) in selected:
+                            found.append(it)
+        order = self._selected_ids()
+        found.sort(key=lambda it: order.index(_button_id(it)) if _button_id(it) in order else 99)
+        found = found[:MAX_ITEMS]
+        moved = []
+        for it in found:
+            bid = _button_id(it)
+            icon = _field(it, "iconView")
+            drawable = icon.getDrawable() if icon is not None else None
+            moved.append((bid, it, drawable, _first_text(it)))
+        for it in found:
+            parent = it.getParent()
+            if parent is not None:
+                parent.removeView(it)
+        for ch in _children(container):
+            if _tag_is(ch, CARD_TAG) and int(ch.getChildCount()) == 0:
+                container.removeView(ch)
+        self._tidy_dividers(container)
+        self.moved = moved
+        self.refresh_dock(mv)
+
+    # ----- строка внизу ---------------------------------------------------
+    def _clear_dock(self, mv):
+        self._dock_row = None
+        content = mv.getParent()
+        if content is None:
+            return
+        for ch in _children(content):
+            if _tag_is(ch, DOCK_TAG):
+                content.removeView(ch)
+        container = self._container(mv)
+        if container is not None:
+            orig = self.orig_padding.pop(id(container), None)
+            if orig is not None:
+                container.setPadding(orig[0], orig[1], orig[2], orig[3])
+
+    def refresh_dock(self, mv):
+        content = mv.getParent()
+        if content is None or not _is_a(content, "android.widget.LinearLayout"):
+            return
+        if not self.moved:
+            self._clear_dock(mv)
+            return
+        from android.view import View, Gravity
+        from android.widget import LinearLayout, FrameLayout, ImageView, TextView
+        from android.graphics import PorterDuff, PorterDuffColorFilter
+        from android.graphics.drawable import GradientDrawable
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+        dp = lambda x: int(AndroidUtilities.dp(float(x)))
+
+        dock = None
+        for ch in _children(content):
+            if _tag_is(ch, DOCK_TAG):
+                dock = ch
+        ctx = mv.getContext()
+        if dock is None:
+            dock = LinearLayout(ctx)
+            dock.setOrientation(LinearLayout.VERTICAL)
+            dock.setTag(DOCK_TAG)
+            content.addView(dock, LinearLayout.LayoutParams(-1, -2))
+        dock.removeAllViews()
+        dock.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+        dock.setPadding(0, 0, 0, int(AndroidUtilities.navigationBarHeight))
+
+        # прокрутка списка больше не должна оставлять место под навигационную панель
+        container = self._container(mv)
+        if container is not None and id(container) not in self.orig_padding:
+            self.orig_padding[id(container)] = (int(container.getPaddingLeft()), int(container.getPaddingTop()),
+                                                int(container.getPaddingRight()), int(container.getPaddingBottom()))
+            container.setPadding(int(container.getPaddingLeft()), int(container.getPaddingTop()),
+                                 int(container.getPaddingRight()), dp(8))
+
+        line = View(ctx)
+        line.setBackgroundColor(Theme.getDividerColor(None))
+        dock.addView(line, LinearLayout.LayoutParams(-1, 1))
+
+        row = LinearLayout(ctx)
+        row.setTag(ROW_TAG)
+        self._dock_row = row
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER)
+        row.setPadding(dp(8), dp(4), dp(8), dp(4))
+        dock.addView(row, LinearLayout.LayoutParams(-1, dp(self._height())))
+
+        self.badges = {}
+        self.proxies = []
+        icon_color = Theme.getColor(Theme.key_windowBackgroundWhiteGrayIcon)
+        for bid, item, drawable, label in self.moved:
+            slot = FrameLayout(ctx)
+            slot.setBackground(Theme.createRadSelectorDrawable(Theme.getColor(Theme.key_listSelector), 12, 12))
+            slot.setContentDescription(label)
+            iv = ImageView(ctx)
+            iv.setScaleType(ImageView.ScaleType.CENTER)
+            if drawable is not None:
+                iv.setImageDrawable(drawable)
+            iv.setColorFilter(PorterDuffColorFilter(icon_color, PorterDuff.Mode.SRC_IN))
+            slot.addView(iv, FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
+
+            badge = TextView(ctx)
+            badge.setTextSize(1, 11.0)
+            badge.setTypeface(AndroidUtilities.bold())
+            badge.setTextColor(Theme.getColor(Theme.key_chats_unreadCounterText))
+            badge.setGravity(Gravity.CENTER)
+            badge.setMinWidth(dp(18))
+            badge.setPadding(dp(5), 0, dp(5), 0)
+            bg = GradientDrawable()
+            bg.setColor(Theme.getColor(Theme.key_chats_unreadCounterMuted))
+            bg.setCornerRadius(float(dp(9)))
+            badge.setBackground(bg)
+            badge.setVisibility(View.GONE)
+            blp = FrameLayout.LayoutParams(-2, dp(18), Gravity.CENTER)
+            slot.addView(badge, blp)
+            badge.setTranslationX(float(dp(13)))
+            badge.setTranslationY(float(-dp(10)))
+            self.badges[bid] = badge
+
+            if PROXY_OK:
+                cp = ClickProxy(lambda v, it=item: it.performClick())
+                lp_ = LongClickProxy(lambda v, t=label: self._show_label(t))
+                self.proxies.extend([cp, lp_])
+                slot.setOnClickListener(cp)
+                slot.setOnLongClickListener(lp_)
+            row.addView(slot, LinearLayout.LayoutParams(0, -1, 1.0))
+        try:
+            from org.telegram.messenger import UserConfig
+            self.refresh_badges(int(UserConfig.selectedAccount))
+        except Exception:
+            pass
+
+    def _show_label(self, text):
+        if text:
+            BulletinHelper.show_info(text)
+        return True
+
+    def _counter(self, bid, account):
+        try:
+            if bid == 14:
+                return int(_jclass("org.telegram.messenger.MessagesStorage").getInstance(account).getArchiveUnreadCount())
+            if bid == 106:
+                return int(_jclass("app.exteraless.feed.FeedController").getInstance(account).getUnreadCount())
+        except Exception:
+            pass
+        return 0
+
+    def refresh_badges(self, account):
+        for bid, badge in list(self.badges.items()):
+            n = self._counter(bid, account)
+            if n > 0:
+                badge.setText(str(n) if n < 1000 else "999+")
+                badge.setVisibility(0)
+            else:
+                badge.setVisibility(8)
